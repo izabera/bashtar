@@ -1,0 +1,114 @@
+#!/bin/bash
+
+# read and extract valid ustar archives
+
+
+exec < <(od -An -vtx1 | sed 's/^ //;s/ /\n/g')
+
+getbytes() { mapfile -tn "$1" bytes; (( ${#bytes} )) || exit 0; }
+
+declare -A file
+
+header() {
+  # tar format = octal + alcohol
+
+  # store numbers as the octal representation in ascii, null terminated
+  # like this: "0000775\0"
+  # obviously a great idea
+
+  getbytes 100
+  printf -v "file[name]" %b "${bytes[@]/#/\\x}"
+
+  # for some reason you need 8 bytes to store the file mode in tar
+  getbytes 8
+  printf -v "file[mode]" %b "${bytes[@]/#/\\x}"
+  file[mode]=${file[mode]:-0}
+
+  getbytes 8
+  printf -v "file[uid]" %b "${bytes[@]/#/\\x}"
+  (( file[uid] = 0${file[uid]:-0} ))
+
+  getbytes 8
+  printf -v "file[gid]" %b "${bytes[@]/#/\\x}"
+  (( file[gid] = 0${file[gid]:-0} ))
+
+  getbytes 12
+  printf -v "file[size]" %b "${bytes[@]/#/\\x}"
+  (( file[size] = 0${file[size]:-0} ))
+
+  getbytes 12
+  printf -v "file[mtime]" %b "${bytes[@]/#/\\x}"
+  (( file[mtime] = 0${file[mtime]:-0} ))
+
+  getbytes 8
+  # ignore checksum for now
+
+  getbytes 1
+  printf -v "file[type]" %b "${bytes[@]/#/\\x}"
+  file[type]=${file[type]:-0}
+
+  getbytes 100
+  printf -v "file[link]" %b "${bytes[@]/#/\\x}"
+
+  getbytes 8
+  # "ustar\0" "00"
+
+  getbytes 32
+  printf -v "file[owner]" %b "${bytes[@]/#/\\x}"
+
+  getbytes 32
+  printf -v "file[group]" %b "${bytes[@]/#/\\x}"
+
+  getbytes 8
+  printf -v "file[major]" %b "${bytes[@]/#/\\x}"
+  (( file[major] = ${file[major]:-0} ))
+
+  getbytes 8
+  printf -v "file[minor]" %b "${bytes[@]/#/\\x}"
+  (( file[minor] = 0${file[minor]:-0} ))
+
+  getbytes 155
+  printf -v "file[prefix]" %b "${bytes[@]/#/\\x}"
+
+  # padding to 512 bytes
+  getbytes 12
+}
+
+decode () {
+  local i tmp
+  for (( i = $1; i; i-- )) do
+    read -r tmp
+    printf "\\x$tmp"
+  done
+}
+
+charblock=([3]=c [4]=b)
+link=([1]= [2]=-s)
+
+while :; do
+  header
+  if [[ -z ${file[name]} ]]; then
+    (( empty++ )) && exit
+    continue
+  else
+    empty=0
+  fi
+
+  case ${file[type]} in
+    [07]) decode "${file[size]}" > "${file[name]}"; getbytes "$(( 512 - (file[size] % 512) ))" ;;
+    [12]) ln ${link[file[type]]} "${file[link]}" "${file[name]}" ;;
+    [34]) mknod "${file[name]}" "${charblock[file[type]]}" "${file[major]}" "${file[minor]}" ;;
+    5) mkdir "${file[name]}" ;;
+    6) mkfifo "${file[name]}" ;;
+    g) ;;     # wat
+    x) ;;     # wat
+    [A-Z]) ;; # wat
+    *) ;;
+  esac
+
+  chown -h "${file[owner]}:${file[group]}" "${file[name]}"
+  if [[ ${file[type]} = [034567] ]]; then
+    chmod "${file[mode]}" "${file[name]}"
+  fi
+  touch -hd "@${file[mtime]}" "${file[name]}"
+done
